@@ -74,6 +74,26 @@ def load_fundamentals(symbol: str) -> pd.DataFrame:
     return base
 
 
+def load_earnings_surprises(symbol: str) -> pd.DataFrame | None:
+    path = RAW / "earnings_surprises" / f"{symbol}.parquet"
+    if not path.exists():
+        return None
+    df = pd.read_parquet(path)
+    if "date" not in df.columns:
+        return None
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return df.dropna(subset=["date"]).sort_values("date")
+
+
+def load_profiles() -> pd.DataFrame | None:
+    path = RAW / "company_profiles.parquet"
+    if not path.exists():
+        return None
+    df = pd.read_parquet(path)
+    df["symbol"] = df["symbol"].astype(str)
+    return df[["symbol", "sector", "industry"]].drop_duplicates("symbol")
+
+
 def load_news(symbol: str) -> pd.DataFrame | None:
     path = RAW / "news" / f"{symbol}.parquet"
     if not path.exists():
@@ -187,6 +207,34 @@ def build():
         pd.DataFrame(pre_rows),
         pd.DataFrame(news_rows),
     ], axis=1)
+
+    # Merge analyst EPS estimates (match on symbol + nearest prior date)
+    surp_frames = []
+    for sym in earnings["symbol"].unique():
+        s = load_earnings_surprises(sym)
+        if s is not None and not s.empty:
+            surp_frames.append(s)
+    if surp_frames:
+        surp_all = pd.concat(surp_frames, ignore_index=True)
+        surp_all["date"] = pd.to_datetime(surp_all["date"])
+        earnings = earnings.sort_values("date").reset_index(drop=True)
+        surp_all = surp_all.sort_values("date")
+        earnings = pd.merge_asof(
+            earnings,
+            surp_all.rename(columns={"date": "surp_date"}),
+            left_on="date", right_on="surp_date",
+            by="symbol",
+            direction="nearest",
+            tolerance=pd.Timedelta(days=45),
+        ).drop(columns=["surp_date"], errors="ignore")
+        print(f"Analyst EPS estimates merged — eps_estimate coverage: "
+              f"{earnings['eps_estimate'].notna().mean():.1%}")
+
+    # Merge sector / industry from company profiles
+    profiles = load_profiles()
+    if profiles is not None:
+        earnings = earnings.merge(profiles, on="symbol", how="left")
+        print(f"Sector coverage: {earnings['sector'].notna().mean():.1%}")
 
     # Merge quarterly fundamentals
     symbols = earnings["symbol"].unique()

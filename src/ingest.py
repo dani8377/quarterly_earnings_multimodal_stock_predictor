@@ -242,6 +242,92 @@ def ingest_news(symbols: list[str]):
 
 
 # ---------------------------------------------------------------------------
+# Analyst earnings surprises (eps_estimate + actual per quarter)
+# ---------------------------------------------------------------------------
+
+def fetch_earnings_surprises(symbol: str) -> pd.DataFrame:
+    data = _get(f"{BASE_URL}/earnings-surprises", {"symbol": symbol})
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    df["symbol"] = symbol
+    for col in ("date", "fiscalDateEnding"):
+        if col in df.columns:
+            df["date"] = pd.to_datetime(df[col], errors="coerce")
+            break
+    if "date" not in df.columns:
+        return pd.DataFrame()
+    df = df[df["date"] >= pd.to_datetime(MIN_DATE)]
+    rename = {
+        "estimatedEarning": "eps_estimate",
+        "actualEarningResult": "eps_actual_surprise",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+    keep = ["symbol", "date"] + [c for c in ["eps_estimate", "eps_actual_surprise"] if c in df.columns]
+    return df[keep].dropna(subset=["date"])
+
+
+def ingest_earnings_surprises(symbols: list[str]):
+    out_dir = RAW / "earnings_surprises"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    done = {p.stem for p in out_dir.glob("*.parquet")}
+    todo = [s for s in symbols if s not in done]
+    print(f"\nearnings_surprises: {len(todo)}/{len(symbols)} remaining")
+    for sym in tqdm(todo, desc="surprises"):
+        try:
+            df = fetch_earnings_surprises(sym)
+            (df if not df.empty else pd.DataFrame({"symbol": [sym]})).to_parquet(
+                out_dir / f"{sym}.parquet", index=False
+            )
+        except Exception as e:
+            print(f"  [WARN] {sym}: {e}")
+        time.sleep(SLEEP)
+
+
+# ---------------------------------------------------------------------------
+# Company profiles (sector, industry)
+# ---------------------------------------------------------------------------
+
+def fetch_company_profiles(symbols: list[str]) -> pd.DataFrame:
+    rows = []
+    for sym in tqdm(symbols, desc="profiles"):
+        try:
+            data = _get(f"{BASE_URL}/profile", {"symbol": sym})
+            if data:
+                rec = data[0] if isinstance(data, list) else data
+                rows.append({
+                    "symbol": sym,
+                    "sector": rec.get("sector", ""),
+                    "industry": rec.get("industry", ""),
+                    "exchange": rec.get("exchangeShortName", ""),
+                })
+        except Exception as e:
+            print(f"  [WARN] {sym}: {e}")
+        time.sleep(SLEEP)
+    return pd.DataFrame(rows)
+
+
+def ingest_company_profiles(symbols: list[str]):
+    out = RAW / "company_profiles.parquet"
+    if out.exists():
+        existing = pd.read_parquet(out)
+        done = set(existing["symbol"].astype(str).tolist())
+        todo = [s for s in symbols if s not in done]
+        print(f"\ncompany_profiles: {len(todo)}/{len(symbols)} remaining")
+        if not todo:
+            return
+        new_df = fetch_company_profiles(todo)
+        combined = pd.concat([existing, new_df], ignore_index=True).drop_duplicates("symbol")
+        combined.to_parquet(out, index=False)
+    else:
+        print(f"\ncompany_profiles: fetching all {len(symbols)} symbols")
+        df = fetch_company_profiles(symbols)
+        if not df.empty:
+            df.to_parquet(out, index=False)
+            print(f"  Saved {len(df)} profiles → {out}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -254,6 +340,8 @@ def main():
     ingest_prices(symbols)
     ingest_benchmarks()
     ingest_news(symbols)
+    ingest_earnings_surprises(symbols)
+    ingest_company_profiles(symbols)
     print("\nAll done.")
 
 
